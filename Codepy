@@ -1,1 +1,340 @@
+"""
+Spotify Discord ESP32 Client — dengan Lirik
+============================================
+Mengambil info lagu dari Spotify, menampilkannya di Discord Rich Presence,
+mengirimkan data + lirik synced ke ESP32 via Serial.
+"""
 
+import json
+import os
+import re
+import sys
+import time
+import logging
+import threading
+from dataclasses import dataclass
+from typing import Optional
+
+import serial
+import serial.tools.list_ports
+import spotipy
+import syncedlyrics
+from dotenv import load_dotenv
+from pypresence import Presence, InvalidID, PipeClosed
+from spotipy.oauth2 import SpotifyOAuth
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+load_dotenv()
+
+SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+SPOTIFY_REDIRECT_URI  = os.getenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
+DISCORD_CLIENT_ID     = os.getenv("DISCORD_CLIENT_ID", "")
+ESP32_PORT            = os.getenv("ESP32_PORT", "COM4")
+ESP32_BAUD            = int(os.getenv("ESP32_BAUD", "115200"))
+UPDATE_INTERVAL       = int(os.getenv("UPDATE_INTERVAL", "1"))
+
+SPOTIFY_SCOPE = (
+    "user-read-playback-state "
+    "user-read-currently-playing "
+    "user-read-playback-position"
+)
+
+
+@dataclass
+class TrackInfo:
+    title: str
+    artist: str
+    album: str
+    album_art_url: str
+    is_playing: bool
+    progress_ms: int
+    duration_ms: int
+    volume: int
+    track_url: str
+    lyric: str      = ""
+    next_lyric: str = ""
+
+    def to_json(self) -> str:
+        return json.dumps({
+            "title":       self.title,
+            "artist":      self.artist,
+            "album":       self.album,
+            "is_playing":  self.is_playing,
+            "progress_ms": self.progress_ms,
+            "duration_ms": self.duration_ms,
+            "volume":      self.volume,
+            "lyric":       self.lyric,
+            "next_lyric":  self.next_lyric,
+        }, ensure_ascii=False)
+
+    def progress_str(self) -> str:
+        cur_s = self.progress_ms // 1000
+        tot_s = self.duration_ms // 1000
+        return f"{cur_s // 60}:{cur_s % 60:02d} / {tot_s // 60}:{tot_s % 60:02d}"
+
+
+class LyricsEngine:
+    def __init__(self) -> None:
+        self._cache_key: str                = ""
+        self._lyrics: list[tuple[int, str]] = []
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _parse_lrc(lrc_text: str) -> list[tuple[int, str]]:
+        pattern = re.compile(r"\[(\d+):(\d+\.\d+)\](.*)")
+        lines: list[tuple[int, str]] = []
+        for line in lrc_text.splitlines():
+            m = pattern.match(line.strip())
+            if m:
+                ms   = int((int(m.group(1)) * 60 + float(m.group(2))) * 1000)
+                text = m.group(3).strip()
+                if text:
+                    lines.append((ms, text))
+        return sorted(lines, key=lambda x: x[0])
+
+    def load(self, title: str, artist: str) -> None:
+        key = f"{title}|{artist}"
+        with self._lock:
+            if key == self._cache_key:
+                return
+            self._cache_key = key
+            self._lyrics    = []
+        log.info(f"[Lyrics] Mencari: {title} — {artist}")
+        try:
+            lrc = syncedlyrics.search(f"{title} {artist}")
+            if lrc:
+                parsed = self._parse_lrc(lrc)
+                with self._lock:
+                    self._lyrics = parsed
+                log.info(f"[Lyrics] {len(parsed)} baris ditemukan.")
+            else:
+                log.info("[Lyrics] Tidak ditemukan.")
+        except Exception as exc:
+            log.warning(f"[Lyrics] Error: {exc}")
+
+    def get_current(self, progress_ms: int) -> tuple[str, str]:
+        with self._lock:
+            lyrics = self._lyrics
+        current = ""
+        nxt     = ""
+        for i, (ts, text) in enumerate(lyrics):
+            if ts <= progress_ms:
+                current = text
+                nxt     = lyrics[i + 1][1] if i + 1 < len(lyrics) else ""
+            else:
+                break
+        return current, nxt
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cache_key = ""
+            self._lyrics    = []
+
+
+class SpotifyClient:
+    def __init__(self) -> None:
+        if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+            log.error("SPOTIFY_CLIENT_ID atau SPOTIFY_CLIENT_SECRET belum diisi di .env!")
+            sys.exit(1)
+        auth = SpotifyOAuth(
+            client_id=SPOTIFY_CLIENT_ID,
+            client_secret=SPOTIFY_CLIENT_SECRET,
+            redirect_uri=SPOTIFY_REDIRECT_URI,
+            scope=SPOTIFY_SCOPE,
+            open_browser=True,
+            cache_path=".spotify_cache",
+        )
+        self.sp = spotipy.Spotify(auth_manager=auth)
+        log.info("Spotify client berhasil dibuat.")
+
+    def get_current_track(self) -> Optional[TrackInfo]:
+        try:
+            playback = self.sp.current_playback()
+        except Exception as exc:
+            log.warning(f"Gagal mengambil data Spotify: {exc}")
+            return None
+        if not playback or not playback.get("item"):
+            return None
+        item     = playback["item"]
+        artists  = ", ".join(a["name"] for a in item.get("artists", []))
+        album    = item.get("album", {})
+        images   = album.get("images", [])
+        art_url  = images[0]["url"] if images else ""
+        ext_urls = item.get("external_urls", {})
+        device   = playback.get("device", {})
+        volume   = device.get("volume_percent", 0) if device else 0
+        return TrackInfo(
+            title         = item.get("name", "Unknown"),
+            artist        = artists or "Unknown Artist",
+            album         = album.get("name", "Unknown Album"),
+            album_art_url = art_url,
+            is_playing    = playback.get("is_playing", False),
+            progress_ms   = playback.get("progress_ms", 0),
+            duration_ms   = item.get("duration_ms", 0),
+            volume        = volume,
+            track_url     = ext_urls.get("spotify", ""),
+        )
+
+
+class DiscordPresence:
+    def __init__(self) -> None:
+        self.rpc: Optional[Presence] = None
+        self._connected  = False
+        self._last_track: Optional[str] = None
+        if not DISCORD_CLIENT_ID:
+            log.warning("DISCORD_CLIENT_ID kosong. Discord Rich Presence dinonaktifkan.")
+            return
+        self._connect()
+
+    def _connect(self) -> None:
+        try:
+            self.rpc = Presence(DISCORD_CLIENT_ID)
+            self.rpc.connect()
+            self._connected = True
+            log.info("Discord Rich Presence terhubung.")
+        except (InvalidID, ConnectionRefusedError, FileNotFoundError):
+            log.warning("Discord tidak bisa dijangkau.")
+            self._connected = False
+        except Exception as exc:
+            log.warning(f"Discord error: {exc}")
+            self._connected = False
+
+    def update(self, track: Optional[TrackInfo]) -> None:
+        if not self._connected or self.rpc is None:
+            return
+        try:
+            if track is None:
+                self.rpc.clear()
+                self._last_track = None
+                return
+            track_key = f"{track.title}|{track.artist}|{track.is_playing}"
+            if track_key == self._last_track:
+                return
+            kwargs: dict = {
+                "details":     track.title[:128],
+                "state":       f"oleh {track.artist}"[:128],
+                "large_image": track.album_art_url or "spotify_logo",
+                "large_text":  track.album,
+                "small_image": "play" if track.is_playing else "pause",
+                "small_text":  "Sedang diputar" if track.is_playing else "Dijeda",
+            }
+            if track.track_url:
+                kwargs["buttons"] = [{"label": "Buka di Spotify", "url": track.track_url}]
+            self.rpc.update(**kwargs)
+            self._last_track = track_key
+            log.info(f"Discord: {track.title} ({'▶' if track.is_playing else '⏸'})")
+        except PipeClosed:
+            log.warning("Discord terputus. Reconnect...")
+            self._connected = False
+            self._connect()
+        except Exception as exc:
+            log.warning(f"Gagal update Discord: {exc}")
+
+    def close(self) -> None:
+        if self._connected and self.rpc:
+            try:
+                self.rpc.clear()
+                self.rpc.close()
+            except Exception:
+                pass
+
+
+class ESP32Serial:
+    def __init__(self) -> None:
+        self.ser: Optional[serial.Serial] = None
+        if not ESP32_PORT:
+            return
+        self._connect()
+
+    def _connect(self) -> None:
+        try:
+            self.ser = serial.Serial(port=ESP32_PORT, baudrate=ESP32_BAUD, timeout=1)
+            time.sleep(2)
+            log.info(f"ESP32 terhubung di {ESP32_PORT} ({ESP32_BAUD} baud).")
+        except serial.SerialException as exc:
+            log.warning(f"Gagal buka port {ESP32_PORT}: {exc}")
+            ports = list(serial.tools.list_ports.comports())
+            if ports:
+                log.info("Port tersedia: " + ", ".join(p.device for p in ports))
+            self.ser = None
+
+    def send(self, track: Optional[TrackInfo]) -> None:
+        if self.ser is None or not self.ser.is_open:
+            return
+        try:
+            payload = track.to_json() if track else json.dumps({
+                "title": "Tidak ada lagu", "artist": "", "album": "",
+                "is_playing": False, "progress_ms": 0, "duration_ms": 0,
+                "volume": 0, "lyric": "", "next_lyric": "",
+            })
+            self.ser.write((payload + "\n").encode("utf-8"))
+        except serial.SerialException as exc:
+            log.warning(f"Gagal kirim ke ESP32: {exc}")
+
+    def close(self) -> None:
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+
+
+def main() -> None:
+    log.info("=" * 50)
+    log.info("  Spotify Discord ESP32 Client  [+Lyrics]")
+    log.info("=" * 50)
+
+    spotify = SpotifyClient()
+    discord = DiscordPresence()
+    esp32   = ESP32Serial()
+    lyrics  = LyricsEngine()
+
+    log.info(f"Update interval: {UPDATE_INTERVAL} detik | Tekan Ctrl+C untuk berhenti.\n")
+
+    last_track_key = ""
+
+    try:
+        while True:
+            track = spotify.get_current_track()
+            if track:
+                track_key = f"{track.title}|{track.artist}"
+                if track_key != last_track_key:
+                    last_track_key = track_key
+                    threading.Thread(
+                        target=lyrics.load,
+                        args=(track.title, track.artist),
+                        daemon=True,
+                    ).start()
+                if track.is_playing:
+                    track.lyric, track.next_lyric = lyrics.get_current(track.progress_ms)
+                else:
+                    track.lyric = track.next_lyric = ""
+                log.info(
+                    f"{'▶' if track.is_playing else '⏸'} "
+                    f"{track.title} - {track.artist} "
+                    f"[{track.progress_str()}] Vol:{track.volume}%"
+                )
+                if track.lyric:
+                    log.info(f"🎵 {track.lyric}")
+            else:
+                log.info("Tidak ada lagu.")
+                last_track_key = ""
+                lyrics.clear()
+
+            discord.update(track)
+            esp32.send(track)
+            time.sleep(UPDATE_INTERVAL)
+
+    except KeyboardInterrupt:
+        log.info("\nDihentikan.")
+    finally:
+        discord.close()
+        esp32.close()
+
+
+if __name__ == "__main__":
+    main()
