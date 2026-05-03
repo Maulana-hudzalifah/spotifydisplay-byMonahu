@@ -1,1 +1,236 @@
+/*
+ ================================================================
+   Spotify + Lirik Display — ESP32-S3 + OLED SH1106 (128x64)
+   Library: U8g2 (olikraus) + ArduinoJson (Blanchon)
+   Wiring : VCC->3.3V | GND->GND | SCL->GPIO9 | SDA->GPIO8
+ ================================================================
+*/
 
+#include <Arduino.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <ArduinoJson.h>
+
+#define PIN_SDA  8
+#define PIN_SCL  9
+
+// Ganti ke U8G2_SH1107_... jika pakai SH1107
+U8G2_SH1106_128X64_NONAME_F_HW_I2C
+    u8g2(U8G2_R0, U8X8_PIN_NONE, PIN_SCL, PIN_SDA);
+
+struct SpotifyData {
+    String title       = "";
+    String artist      = "";
+    String album       = "";
+    bool   is_playing  = false;
+    long   progress_ms = 0;
+    long   duration_ms = 1;
+    int    volume      = 0;
+    String lyric       = "";
+    String next_lyric  = "";
+};
+
+SpotifyData track;
+
+String   serialBuf        = "";
+String   prevLyric        = "";
+String   prevTitle        = "";
+bool     titleNeedsScroll = false;
+int      titleScrollX     = 128;
+uint32_t lastMillis       = 0;
+uint32_t lastScroll       = 0;
+uint32_t lastFrame        = 0;
+uint32_t lastSerial       = 0;
+
+#define SCROLL_INTERVAL  55
+#define FRAME_INTERVAL   33
+#define SERIAL_TIMEOUT   5000
+
+String trunc(const String& s, uint8_t n) {
+    if ((int)s.length() <= n) return s;
+    return s.substring(0, n - 1) + "~";
+}
+
+void drawProgressBar(long prog, long dur) {
+    const int X = 0, Y = 60, W = 110, H = 3;
+    u8g2.drawRFrame(X, Y, W, H, 1);
+    if (dur > 0) {
+        int f = (int)((float)prog / dur * W);
+        if (f > 0) u8g2.drawRBox(X, Y, f, H, 1);
+    }
+    char buf[8];
+    long cur = prog / 1000;
+    snprintf(buf, sizeof(buf), "%ld:%02ld", cur / 60, cur % 60);
+    u8g2.setFont(u8g2_font_4x6_tf);
+    u8g2.drawStr(112, 64, buf);
+}
+
+void drawSplash() {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_7x13B_tf);
+    u8g2.drawStr(14, 22, "Spotify OLED");
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.drawStr(22, 36, "ESP32-S3  Ready");
+    u8g2.drawStr(8, 52, "Menunggu koneksi PC...");
+    u8g2.sendBuffer();
+}
+
+void drawIdle() {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_6x10_tf);
+    u8g2.drawStr(14, 26, "Tidak ada lagu");
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.drawStr(10, 40, "Putar lagu di Spotify");
+    u8g2.drawLine(56, 50, 56, 57);
+    u8g2.drawLine(59, 48, 59, 55);
+    u8g2.drawLine(56, 50, 59, 48);
+    u8g2.drawDisc(54, 57, 2);
+    u8g2.drawDisc(57, 55, 2);
+    u8g2.sendBuffer();
+}
+
+void drawDisconnect() {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.drawStr(20, 24, "PC tidak terhubung");
+    u8g2.drawStr(16, 38, "Jalankan main.py");
+    u8g2.sendBuffer();
+}
+
+void drawMain() {
+    u8g2.clearBuffer();
+
+    if (track.is_playing) {
+        u8g2.drawTriangle(0, 2, 0, 10, 6, 6);
+    } else {
+        u8g2.drawBox(0, 2, 2, 8);
+        u8g2.drawBox(4, 2, 2, 8);
+    }
+
+    u8g2.setFont(u8g2_font_7x13B_tf);
+    if (titleNeedsScroll) {
+        u8g2.setClipWindow(9, 0, 127, 13);
+        u8g2.drawStr(titleScrollX, 12, track.title.c_str());
+        u8g2.setMaxClipWindow();
+    } else {
+        u8g2.drawStr(9, 12, track.title.c_str());
+    }
+
+    u8g2.setFont(u8g2_font_5x7_tf);
+    u8g2.drawStr(0, 22, trunc(track.artist, 20).c_str());
+    char volBuf[6];
+    snprintf(volBuf, sizeof(volBuf), "%d%%", track.volume);
+    u8g2.drawStr(104, 22, volBuf);
+
+    u8g2.drawHLine(0, 24, 128);
+
+    if (track.lyric.length() > 0) {
+        u8g2.setFont(u8g2_font_6x10_tf);
+        const int MAX_CH = 21;
+        String l1, l2;
+        if ((int)track.lyric.length() <= MAX_CH) {
+            l1 = track.lyric; l2 = "";
+        } else {
+            int split = track.lyric.lastIndexOf(' ', MAX_CH);
+            if (split <= 0) split = MAX_CH;
+            l1 = track.lyric.substring(0, split);
+            l2 = track.lyric.substring(split + 1);
+            if ((int)l2.length() > MAX_CH)
+                l2 = l2.substring(0, MAX_CH - 1) + "~";
+        }
+        int baseY = (l2.length() == 0) ? 40 : 35;
+        u8g2.drawStr(0, baseY, l1.c_str());
+        if (l2.length() > 0)
+            u8g2.drawStr(0, baseY + 11, l2.c_str());
+        if (track.next_lyric.length() > 0) {
+            u8g2.setFont(u8g2_font_4x6_tf);
+            u8g2.drawStr(0, 56, ("  " + trunc(track.next_lyric, 32)).c_str());
+        }
+    } else {
+        u8g2.setFont(u8g2_font_5x7_tf);
+        u8g2.drawStr(24, 42, "~ instrumental ~");
+    }
+
+    u8g2.drawHLine(0, 58, 128);
+    drawProgressBar(track.progress_ms, track.duration_ms);
+    u8g2.sendBuffer();
+}
+
+void parseJson(const String& raw) {
+    StaticJsonDocument<512> doc;
+    DeserializationError err = deserializeJson(doc, raw);
+    if (err) { Serial.printf("[JSON] Err: %s\n", err.c_str()); return; }
+
+    track.title       = doc["title"]       | "";
+    track.artist      = doc["artist"]      | "";
+    track.album       = doc["album"]       | "";
+    track.is_playing  = doc["is_playing"]  | false;
+    track.progress_ms = doc["progress_ms"] | 0;
+    track.duration_ms = doc["duration_ms"] | 1;
+    track.volume      = doc["volume"]      | 0;
+
+    String newLyric   = doc["lyric"]       | "";
+    if (newLyric != prevLyric) prevLyric = newLyric;
+    track.lyric       = newLyric;
+    track.next_lyric  = doc["next_lyric"]  | "";
+
+    if (track.title != prevTitle) {
+        prevTitle    = track.title;
+        titleScrollX = 128;
+        u8g2.setFont(u8g2_font_7x13B_tf);
+        titleNeedsScroll = (u8g2.getStrWidth(track.title.c_str()) > 118);
+    }
+    lastSerial = millis();
+}
+
+void setup() {
+    Serial.begin(115200);
+    Wire.begin(PIN_SDA, PIN_SCL);
+    Wire.setClock(400000);
+    u8g2.begin();
+    u8g2.setContrast(220);
+    drawSplash();
+    delay(2000);
+    lastMillis = lastSerial = millis();
+}
+
+void loop() {
+    uint32_t ms = millis();
+
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\n') {
+            serialBuf.trim();
+            if (serialBuf.length() > 2) parseJson(serialBuf);
+            serialBuf = "";
+        } else {
+            serialBuf += c;
+            if (serialBuf.length() > 700) serialBuf = "";
+        }
+    }
+
+    if (track.is_playing) {
+        track.progress_ms += (long)(ms - lastMillis);
+        if (track.progress_ms > track.duration_ms)
+            track.progress_ms = track.duration_ms;
+    }
+    lastMillis = ms;
+
+    if (ms - lastScroll >= SCROLL_INTERVAL) {
+        lastScroll = ms;
+        if (titleNeedsScroll) {
+            titleScrollX -= 2;
+            u8g2.setFont(u8g2_font_7x13B_tf);
+            int w = u8g2.getStrWidth(track.title.c_str());
+            if (titleScrollX < -(w + 20)) titleScrollX = 128;
+        }
+    }
+
+    if (ms - lastFrame >= FRAME_INTERVAL) {
+        lastFrame = ms;
+        bool dc = (ms - lastSerial > SERIAL_TIMEOUT);
+        if (dc)                                           drawDisconnect();
+        else if (!track.is_playing && track.title == "")  drawIdle();
+        else                                              drawMain();
+    }
+}
